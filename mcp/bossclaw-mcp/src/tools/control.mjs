@@ -6,6 +6,31 @@
 // （executionMode==='auto'）时对 agent 开放，且复用应用自带安全投递引擎——安全不变量仍在渲染层强制。
 import { controlCall, getPath, ok, fail, truncate, PATHS, bridgeHint } from '../context.mjs';
 import { obj, str, bool, enumStr, WRITE_LOCAL, READ_ONLY } from '../schema.mjs';
+import { validateActionParams } from '../actionSchema.mjs';
+import { classifyError, failStructured } from '../errors.mjs';
+import { sendIdempotency, idempotencyKey, SEND_SCOPE } from '../idempotency.mjs';
+
+/**
+ * 密钥字段脱敏（P0 优化）：app_state 的 structuredContent 原先会把完整 state 原样回传，
+ * 其中 settings.config.model.apiKey 是用户真实密钥明文——等于每次查状态都把密钥塞进
+ * agent 上下文。此处在 MCP 边界统一脱敏：键名命中 apiKey/token/secret/password 的
+ * 非空字符串一律替换为占位符；需要「是否已配置」看布尔语义即可，不需要真值。
+ */
+function redactSecrets(v) {
+  if (Array.isArray(v)) return v.map(redactSecrets);
+  if (v && typeof v === 'object') {
+    const out = {};
+    for (const [k, val] of Object.entries(v)) {
+      if (/api[-_]?key|token|secret|password/i.test(k) && typeof val === 'string' && val) {
+        out[k] = '***redacted***';
+      } else {
+        out[k] = redactSecrets(val);
+      }
+    }
+    return out;
+  }
+  return v;
+}
 
 /** 渲染层白名单动作（src/lib/controlRuntime.ts 为唯一权威实现） */
 const RENDERER_ACTIONS = [
@@ -110,7 +135,7 @@ export const controlTools = [
     }),
     handler: async (args = {}) => {
       const res = await controlCall('GET', '/state', null, 10_000);
-      if (!res.ok) return fail(`${res.error}\n\n${await bridgeHint()}`, { unavailable: !!res.unavailable });
+      if (!res.ok) return failStructured(`${res.error}\n\n${await bridgeHint()}`, { unavailable: !!res.unavailable });
 
       let engine = null;
       if (args.includeEngine) {
@@ -122,10 +147,12 @@ export const controlTools = [
       if (args.path) {
         const picked = getPath(data, args.path);
         if (picked === undefined) return fail(`路径不存在：${args.path}（顶层键：${Object.keys(data || {}).join(', ')}）`);
-        return ok(`${args.path} =\n\n${truncate(JSON.stringify(picked, null, 2), 30000)}`, { path: args.path, value: picked });
+        const safePicked = redactSecrets(picked);
+        return ok(`${args.path} =\n\n${truncate(JSON.stringify(safePicked, null, 2), 30000)}`, { path: args.path, value: safePicked });
       }
       if (args.full) {
-        return ok(truncate(JSON.stringify(data, null, 2), 60000), data);
+        const safeData = redactSecrets(data);
+        return ok(truncate(JSON.stringify(safeData, null, 2), 60000), safeData);
       }
 
       const app = data?.app || {};
@@ -168,7 +195,42 @@ export const controlTools = [
         ``,
         `提示：需要细节用 path 参数取子路径（例如 path="settings.config"）。`,
       ].filter(Boolean);
-      return ok(lines.join('\n'), data);
+      // P0 优化：默认模式下 structuredContent 只回与文本摘要同口径的精简对象，
+      // 不再把完整 state（含简历全文/日志/密钥字段）原样塞进 agent 上下文。
+      // 完整数据仍可经 full:true 或 path 取得（且已经过 redactSecrets 脱敏）。
+      const summaryData = {
+        mode: 'summary',
+        pid: res.data?.pid ?? null,
+        at: res.data?.at ?? null,
+        app: {
+          activeRoute: app.activeRoute,
+          theme: app.theme,
+          autoAssist: app.autoAssist,
+          bossLoggedIn: app.bossLoggedIn,
+          pauseRemainMin: app.pauseRemainMin ?? 0,
+        },
+        config: {
+          executionMode: cfg.executionMode,
+          maxActionsPerMinute: cfg.maxActionsPerMinute,
+          minScore: cfg.minScore,
+          betweenJobsSeconds: cfg.betweenJobsSeconds,
+          hasApiKey: !!cfg.model?.apiKey,
+          platforms: Object.fromEntries(
+            Object.entries(cfg.platforms || {}).map(([k, v]) => [k, { enabled: !!v?.enabled, dailyTarget: v?.dailyTarget }])
+          ),
+        },
+        pending,
+        stats,
+        autochat: { running: !!auto.chatRunning, index: auto.progress?.index ?? 0, total: auto.progress?.total ?? 0 },
+        scheduleCount: (data?.schedule?.entries || []).length,
+        agentAnswer: {
+          online: !!aa.online,
+          pending: aa.pending ?? 0,
+          answered: aa.answered ?? 0,
+          timeouts: aa.timeouts ?? 0,
+        },
+      };
+      return ok(lines.join('\n'), summaryData);
     },
   },
 
@@ -213,42 +275,73 @@ export const controlTools = [
     inputSchema: obj(
       {
         action: enumStr('动作类型', ACTIONS),
-        params: { type: 'object', description: '动作参数（见工具描述）', additionalProperties: true },
+        params: { type: 'object', description: '动作参数（见工具描述；MCP 层会按动作做必填/类型校验）', additionalProperties: true },
+        idempotencyKey: str('幂等键（可选，仅对 deliverySendNow 生效）：同一键+同一参数的重复调用在 10 分钟内只真正执行一次'),
       },
       ['action']
     ),
     handler: async (args) => {
       if (!ACTIONS.includes(args.action)) return fail(`不支持的动作：${args.action}`);
-      // AI 动作（aiAnalyzeJob/aiTailorResume）含真实 LLM 调用（或 agent 代答往返），较长耗时；
-      // agentTasks 是长轮询，超时按 waitMs 放宽。统一给宽超时。
-      const waitMs = Math.min(Math.max(Number(args.params?.waitMs) || 0, 0), 55_000);
-      const timeoutMs = args.action === 'agentTasks' ? waitMs + 20_000 : /^ai/.test(args.action) ? 200_000 : 90_000;
-      const res = await controlCall('POST', '/action', { action: args.action, params: args.params || {} }, timeoutMs);
-      if (!res.ok) {
-        return fail(`动作 ${args.action} 失败：${res.error || '未知错误'}\n\n${await bridgeHint()}`, {
-          unavailable: !!res.unavailable,
-          detail: res.data,
-        });
+      // P0-1: 动作级参数校验在 MCP 层先行拦截（必填/类型/枚举/范围），
+      // 不再把写错的参数穿透到渲染层才报错。校验口径见 actionSchema.mjs。
+      const rawParams = args.params || {};
+      const { idempotencyKey: _topKey, ...paramsNoTop } = rawParams;
+      const explicitKey = args.idempotencyKey || rawParams.idempotencyKey;
+      const check = validateActionParams(args.action, paramsNoTop);
+      if (!check.ok) {
+        const structured = { category: 'invalid_params', retryable: false, requireHuman: false };
+        return fail(
+          `动作 ${args.action} 参数校验失败（已在 MCP 层拦截，未调用应用）：\n${check.errors.map((e) => `- ${e}`).join('\n')}\n\nstructured_error=${JSON.stringify(structured)}`,
+          { error: structured, validationErrors: check.errors }
+        );
       }
-      const payload = res.data || {};
-      const known = new Set(['applied', 'message', 'previous', 'next', 'ok', 'image']);
-      const extra = Object.fromEntries(Object.entries(payload).filter(([k]) => !known.has(k)));
-      const lines = [
-        `动作 ${args.action}：${payload.applied === false ? '❌ 未生效' : '✅ 已执行'}`,
-        payload.message ? `说明：${payload.message}` : '',
-        payload.previous !== undefined ? `原值：${JSON.stringify(payload.previous)}` : '',
-        payload.next !== undefined ? `新值：${JSON.stringify(payload.next)}` : '',
-        Object.keys(extra).length ? `\n${truncate(JSON.stringify(extra, null, 2), 4000)}` : '',
-      ].filter(Boolean);
-      // structuredContent 不重复携带图片 base64（否则响应体积翻倍，且部分客户端会拒绝超大结构化数据）；
-      // 图片只通过 content 的 image 块传递，文件路径留在 next.file 里可复查。
-      const { image, ...dataWithoutImage } = payload;
-      const out = { text: lines.join('\n'), data: dataWithoutImage, isError: payload.applied === false };
-      if (image?.base64) {
-        out.images = [{ base64: image.base64, mimeType: image.mimeType || 'image/png' }];
-        out.text = `${out.text}\n\n（已附带应用截图，mimeType=${image.mimeType || 'image/png'}）`;
+      const execute = async () => {
+        // AI 动作（aiAnalyzeJob/aiTailorResume）含真实 LLM 调用（或 agent 代答往返），较长耗时；
+        // agentTasks 是长轮询，超时按 waitMs 放宽。统一给宽超时。
+        const waitMs = Math.min(Math.max(Number(paramsNoTop?.waitMs) || 0, 0), 55_000);
+        const timeoutMs = args.action === 'agentTasks' ? waitMs + 20_000 : /^ai/.test(args.action) ? 200_000 : 90_000;
+        const res = await controlCall('POST', '/action', { action: args.action, params: paramsNoTop }, timeoutMs);
+        if (!res.ok) {
+          // P0-3: 失败统一附结构化错误（风控码/retryable/requireHuman），见 errors.mjs。
+          return failStructured(`动作 ${args.action} 失败：${res.error || '未知错误'}\n\n${await bridgeHint()}`, {
+            unavailable: !!res.unavailable,
+            detail: res.data,
+          });
+        }
+        const payload = res.data || {};
+        const known = new Set(['applied', 'message', 'previous', 'next', 'ok', 'image']);
+        const extra = Object.fromEntries(Object.entries(payload).filter(([k]) => !known.has(k)));
+        const lines = [
+          `动作 ${args.action}：${payload.applied === false ? '❌ 未生效' : '✅ 已执行'}`,
+          payload.message ? `说明：${payload.message}` : '',
+          payload.previous !== undefined ? `原值：${JSON.stringify(payload.previous)}` : '',
+          payload.next !== undefined ? `新值：${JSON.stringify(payload.next)}` : '',
+          Object.keys(extra).length ? `\n${truncate(JSON.stringify(extra, null, 2), 4000)}` : '',
+        ].filter(Boolean);
+        // structuredContent 不重复携带图片 base64（否则响应体积翻倍，且部分客户端会拒绝超大结构化数据）；
+        // 图片只通过 content 的 image 块传递，文件路径留在 next.file 里可复查。
+        const { image, ...dataWithoutImage } = payload;
+        const out = { text: lines.join('\n'), data: dataWithoutImage, isError: payload.applied === false };
+        if (out.isError) {
+          // 已执行但未生效（如被风控拦下）：同样附结构化错误，agent 据此决定停手交人工还是重试。
+          const structured = classifyError(payload.message, payload);
+          if (structured) {
+            out.text = `${out.text}\n\nstructured_error=${JSON.stringify(structured)}`;
+            out.data = { ...out.data, error: structured };
+          }
+        }
+        if (image?.base64) {
+          out.images = [{ base64: image.base64, mimeType: image.mimeType || 'image/png' }];
+          out.text = `${out.text}\n\n（已附带应用截图，mimeType=${image.mimeType || 'image/png'}）`;
+        }
+        return out;
+      };
+      // P0-4: 发送类动作走 MCP 层幂等去重（同键/同参数 10 分钟内只真正发送一次）。
+      const scope = `bossclaw_app_action:${args.action}`;
+      if (SEND_SCOPE.has(scope)) {
+        return sendIdempotency.run(idempotencyKey(scope, paramsNoTop, explicitKey), execute);
       }
-      return out;
+      return execute();
     },
   },
 ];

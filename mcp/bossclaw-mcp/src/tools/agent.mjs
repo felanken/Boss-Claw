@@ -13,6 +13,8 @@
 // 门控与实现都在渲染层 controlRuntime.ts 的 deliverySendNow（唯一权威），此处只透传。
 import { controlCall, truncate, PATHS, ok, fail, bridgeHint } from '../context.mjs';
 import { obj, str, bool, num, READ_ONLY, WRITE_LOCAL } from '../schema.mjs';
+import { failStructured } from '../errors.mjs';
+import { sendIdempotency, idempotencyKey } from '../idempotency.mjs';
 
 /** 渲染层动作名 → 长超时（长轮询动作按 waitMs 放宽） */
 function timeoutFor(action, params) {
@@ -65,7 +67,7 @@ export const agentTools = [
         includeMessages: args.includeMessages !== false,
         limit: Number(args.limit) || 10,
       });
-      if (!res.ok) return fail(`${res.error}\n\n${await bridgeHint()}`, { unavailable: !!res.unavailable });
+      if (!res.ok) return failStructured(`${res.error}\n\n${await bridgeHint()}`, { unavailable: !!res.unavailable });
 
       const payload = res.data || {};
       const next = payload.next || {};
@@ -128,7 +130,7 @@ export const agentTools = [
       if (!args.id) return fail('缺少 id（来自 bossclaw_agent_tasks 的任务 id）');
       if (typeof args.content !== 'string' || !args.content.trim()) return fail('content 不能为空');
       const res = await callAgentAction('agentSubmit', { id: String(args.id), content: args.content });
-      if (!res.ok) return fail(`${res.error}\n\n${await bridgeHint()}`, { unavailable: !!res.unavailable });
+      if (!res.ok) return failStructured(`${res.error}\n\n${await bridgeHint()}`, { unavailable: !!res.unavailable });
       const payload = res.data || {};
       const out = ok(
         `${payload.applied === false ? '❌ 未回填' : '✅ 已回填'}\n说明：${payload.message || '-'}\n队列剩余挂起：${payload.next?.remaining ?? '-'}`,
@@ -160,7 +162,7 @@ export const agentTools = [
         id: String(args.id),
         ...(args.reason ? { reason: String(args.reason) } : {}),
       });
-      if (!res.ok) return fail(`${res.error}\n\n${await bridgeHint()}`, { unavailable: !!res.unavailable });
+      if (!res.ok) return failStructured(`${res.error}\n\n${await bridgeHint()}`, { unavailable: !!res.unavailable });
       const payload = res.data || {};
       return ok(`${payload.applied === false ? '❌ 未生效' : '✅ 已放弃'}\n说明：${payload.message || '-'}`, {
         applied: payload.applied !== false,
@@ -185,20 +187,25 @@ export const agentTools = [
     annotations: WRITE_LOCAL,
     inputSchema: obj({
       greeting: str('招呼语（可选；不传则用页面当前内容）'),
+      idempotencyKey: str('幂等键（可选）：同一键+同一招呼语的重复调用在 10 分钟内只真正发送一次'),
     }),
     handler: async (args = {}) => {
       const params = {};
       if (args.greeting != null && String(args.greeting).trim()) params.greeting = String(args.greeting);
-      const res = await callAgentAction('deliverySendNow', params);
-      if (!res.ok) return fail(`${res.error}\n\n${await bridgeHint()}`, { unavailable: !!res.unavailable });
-      const payload = res.data || {};
-      const out = ok(
-        `${payload.applied === false ? '❌ 未触发' : '✅ 已触发'}\n说明：${payload.message || '-'}` +
-          (payload.next && payload.next.hint ? `\n${payload.next.hint}` : ''),
-        { applied: payload.applied !== false, message: payload.message, next: payload.next }
-      );
-      if (payload.applied === false) out.isError = true;
-      return out;
+      // P0-4: 发送类动作走 MCP 层幂等去重，与 bossclaw_app_action 的 deliverySendNow 同口径。
+      const scope = 'bossclaw_agent_send:deliverySendNow';
+      return sendIdempotency.run(idempotencyKey(scope, params, args.idempotencyKey), async () => {
+        const res = await callAgentAction('deliverySendNow', params);
+        if (!res.ok) return failStructured(`${res.error}\n\n${await bridgeHint()}`, { unavailable: !!res.unavailable });
+        const payload = res.data || {};
+        const out = ok(
+          `${payload.applied === false ? '❌ 未触发' : '✅ 已触发'}\n说明：${payload.message || '-'}` +
+            (payload.next && payload.next.hint ? `\n${payload.next.hint}` : ''),
+          { applied: payload.applied !== false, message: payload.message, next: payload.next }
+        );
+        if (payload.applied === false) out.isError = true;
+        return out;
+      });
     },
   },
 ];
