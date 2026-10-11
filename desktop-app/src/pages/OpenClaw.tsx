@@ -8,17 +8,18 @@
  * - 桥接日志（logs 卡，可刷新）
  */
 import { useEffect, useRef, useState } from 'react';
-import { Button, Card, Space, Tag, Typography, message, Spin, Tooltip } from 'antd';
+import { Button, Card, Input, Space, Tag, Typography, message, Spin, Tooltip } from 'antd';
 import { ApiOutlined, PlayCircleOutlined, PauseCircleOutlined, StopOutlined, FileTextOutlined, UploadOutlined, CloseCircleFilled } from '@ant-design/icons';
 import { useAppStore } from '@/store/useAppStore';
 
 const { Paragraph, Text } = Typography;
 const BRIDGE_PORT = 18765;
-const BRIDGE_TOKEN = 'bossclaw-desktop-bridge';
+import { BRIDGE_TOKEN_STORAGE_KEY, getBridgeToken } from '@/lib/bridgeClient';
 const base = `http://127.0.0.1:${BRIDGE_PORT}`;
 
 export default function OpenClaw() {
   const [status, setStatus] = useState<any>(null);
+  const [tokenInput, setTokenInput] = useState(() => getBridgeToken());
   const [report, setReport] = useState('');
   const [logs, setLogs] = useState<any>(null);
   const [loading, setLoading] = useState(false);
@@ -28,11 +29,12 @@ export default function OpenClaw() {
   const setBridgeStatus = useAppStore((s) => s.setBridgeStatus);
 
   const call = async (route: string, method = 'GET', body?: any) => {
-    const url = `${base}${route}?token=${BRIDGE_TOKEN}`;
+    const url = `${base}${route}`;
     // P30：桥接 HTTP 超时兜底——本地桥半开（端口占用但无响应）时避免请求永久挂起
+    // token 经请求头传递（不进 URL/日志），值来自本机保存（见下方 token 设置行）。
     const res = await fetch(url, {
       method,
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      headers: { 'x-bossclaw-token': getBridgeToken(), ...(body ? { 'Content-Type': 'application/json' } : {}) },
       body: body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(15000),
     });
@@ -135,6 +137,31 @@ export default function OpenClaw() {
           <Button icon={<StopOutlined />} onClick={() => control('stop')}>停止</Button>
           <Button onClick={loadReport}>查看日报</Button>
           <Button onClick={loadLogs}>查看日志</Button>
+        </Space>
+        {/* 桥接 token：桥服务首启时在本机生成随机 token 并写入 ~/.bossclaw/bridge-token.json，
+            不再随源码公开。在此粘贴一次即可（存本机 localStorage，经请求头传递）。 */}
+        <Space wrap style={{ marginTop: 8 }}>
+          <Input.Password
+            size="small"
+            style={{ width: 320 }}
+            placeholder="桥接 token（见 ~/.bossclaw/bridge-token.json）"
+            value={tokenInput}
+            onChange={(e) => setTokenInput(e.target.value)}
+          />
+          <Button
+            size="small"
+            onClick={() => {
+              try {
+                localStorage.setItem(BRIDGE_TOKEN_STORAGE_KEY, tokenInput.trim());
+                message.success('桥接 token 已保存到本机');
+                refresh();
+              } catch {
+                message.error('保存失败：localStorage 不可用');
+              }
+            }}
+          >
+            保存 token
+          </Button>
         </Space>
       </Card>
 

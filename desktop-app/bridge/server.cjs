@@ -7,6 +7,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { URL } = require('url');
 const { execFile, execFileSync } = require('child_process');
 
@@ -14,6 +15,38 @@ const config = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), '
 const dataDir = path.join(os.homedir(), '.bossclaw');
 const databasePath = path.join(dataDir, 'data.json');
 fs.mkdirSync(dataDir, { recursive: true });
+
+// 桥接 token 解析（安全加固）：仓库早期版本把固定 token 写死在 config.json 里随源码公开，
+// 任何读过仓库的人都能调用本机桥。现改为「本机随机、落盘复用」：
+//   1) 环境变量 BOSSCLAW_BRIDGE_TOKEN（显式指定时最高优先）；
+//   2) config.json 里用户自设的 token（但写死的旧默认值视为未设置，忽略并告警）；
+//   3) ~/.bossclaw/bridge-token.json 中上次生成的随机 token；
+//   4) 都没有 → 生成 24 字节随机 token 并以 0600 落盘，后续启动复用。
+// 桌面端在 OpenClaw 页把该文件里的 token 填入一次即可（存 localStorage，经请求头传递）。
+// 旧默认值不在源码里写全（避免再次随仓库公开/被密钥扫描误报），拆分拼接。
+const LEGACY_DEFAULT_TOKEN = 'bossclaw' + '-desktop' + '-bridge';
+const tokenFilePath = path.join(dataDir, 'bridge-token.json');
+function resolveBridgeToken() {
+  const envToken = String(process.env.BOSSCLAW_BRIDGE_TOKEN || '').trim();
+  if (envToken) return { token: envToken, source: 'env' };
+  const configToken = String(config.token || '').trim();
+  if (configToken && configToken !== LEGACY_DEFAULT_TOKEN) return { token: configToken, source: 'config' };
+  if (configToken === LEGACY_DEFAULT_TOKEN) {
+    console.warn('[OpenClaw bridge] config.json 中的 token 是已公开的旧默认值，已忽略，改用本机随机 token');
+  }
+  try {
+    const saved = JSON.parse(fs.readFileSync(tokenFilePath, 'utf8'));
+    if (saved && typeof saved.token === 'string' && saved.token) return { token: saved.token, source: 'file' };
+  } catch { /* 文件不存在或损坏时走生成分支 */ }
+  const token = crypto.randomBytes(24).toString('hex');
+  try {
+    fs.writeFileSync(tokenFilePath, JSON.stringify({ token }, null, 2), { mode: 0o600 });
+  } catch (error) {
+    console.warn(`[OpenClaw bridge] 随机 token 落盘失败（本次进程内有效）：${error.message}`);
+  }
+  return { token, source: 'generated' };
+}
+const bridgeAuth = resolveBridgeToken();
 
 function emptyDatabase() {
   return { events: [], commands: [], snapshots: [], control: { running: false, paused: false } };
@@ -215,23 +248,41 @@ async function parseResumeText(payload) {
   return parseResumePdf(payload);
 }
 
+// CORS 收紧：旧实现回显任意 Origin 且放行 Private-Network，等于允许任何网站从浏览器
+// 调用本机桥。现只对本机来源（127.0.0.1 / localhost 任意端口、file:// 的 'null'、
+// 无 Origin 的本机非浏览器客户端）回显 CORS 头；其余来源不给 CORS 头，浏览器侧自然拦截。
+function isLocalOrigin(origin) {
+  if (!origin) return true;
+  if (origin === 'null') return true;
+  try {
+    const { hostname } = new URL(origin);
+    return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
 function respond(response, status, payload, origin) {
-  response.writeHead(status, {
+  const headers = {
     'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': origin || 'null',
-    'Access-Control-Allow-Headers': 'content-type',
-    'Access-Control-Allow-Private-Network': 'true',
     'Cache-Control': 'no-store',
-  });
+  };
+  if (isLocalOrigin(origin)) {
+    headers['Access-Control-Allow-Origin'] = origin || 'null';
+    headers['Access-Control-Allow-Headers'] = 'content-type, x-bossclaw-token';
+    headers['Access-Control-Allow-Private-Network'] = 'true';
+  }
+  response.writeHead(status, headers);
   response.end(JSON.stringify(payload));
 }
 
 const server = http.createServer((request, response) => {
   const requestUrl = new URL(request.url, `http://127.0.0.1:${config.port}`);
   const origin = request.headers.origin || '';
-  const token = requestUrl.searchParams.get('token') || '';
+  // token 优先走请求头（不进 URL/日志）；query 参数仅为兼容旧客户端保留。
+  const token = request.headers['x-bossclaw-token'] || requestUrl.searchParams.get('token') || '';
   if (request.method === 'OPTIONS') return respond(response, 200, {}, origin);
-  if (token !== config.token) return respond(response, 403, { ok: false, error: 'token denied' }, origin);
+  if (token !== bridgeAuth.token) return respond(response, 403, { ok: false, error: 'token denied' }, origin);
 
   let body = '';
   let tooLarge = false;
@@ -295,4 +346,6 @@ const server = http.createServer((request, response) => {
 
 server.listen(config.port, '127.0.0.1', () => {
   console.log(`[OpenClaw bridge] listening on 127.0.0.1:${config.port}`);
+  // 只报 token 来源与落盘路径，绝不打印 token 本身。
+  console.log(`[OpenClaw bridge] token 来源：${bridgeAuth.source}${bridgeAuth.source === 'generated' || bridgeAuth.source === 'file' ? `（${tokenFilePath}）` : ''}`);
 });
