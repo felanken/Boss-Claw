@@ -23,15 +23,17 @@ export const RISK_CODES = {
   5004: { severity: 'env', requireHuman: false, retryable: true, cooldownMs: 10 * 60 * 1000 },
 };
 
-/** 文案关键词 -> 风控码（对齐 safety.ts 的文本分类口径，仅用于无显式 code 时的兜底） */
-const TEXT_PATTERNS = [
-  { code: 32, re: /封禁|已被限制|账户被限制|账号被限制/ },
-  { code: 35, re: /安全验证|滑动验证|滑块验证|点选验证|图形验证|行为验证|请完成验证|验证码/ },
-  { code: 36, re: /账户异常|账号异常/ },
-  { code: 37, re: /环境异常|security-check/ },
-  { code: 31, re: /登录已失效|登录失效|会话失效|未登录/ },
-  { code: 1006, re: /过于频繁|限速|请求频繁/ },
-];
+/** 从数据对象里取显式数值 code 字段（评审定版：只认结构化字段，不扫自由文本关键词） */
+function explicitCode(data) {
+  if (!data || typeof data !== 'object') return null;
+  for (const k of ['code', 'errorCode', 'riskCode', 'statusCode']) {
+    const v = data[k];
+    if (typeof v === 'number' && RISK_CODES[v]) return v;
+    if (typeof v === 'string' && /^\d{2,4}$/.test(v) && RISK_CODES[Number(v)]) return Number(v);
+  }
+  if (data.error && typeof data.error === 'object') return explicitCode(data.error);
+  return null;
+}
 
 /**
  * 从错误文本 / 返回数据里提取结构化错误。
@@ -39,18 +41,16 @@ const TEXT_PATTERNS = [
  *   识别不出风控/瞬时信号时返回 null（普通失败，不臆测）。
  */
 export function classifyError(text, data) {
-  const hay = `${String(text || '')}\n${safeJson(data)}`;
-  // 1) 显式风控码：code 35 / code=35 / code:35 / 风控码 35 / 「错误码 35」
-  const m = hay.match(/(?:风控码|错误码|code)\s*[=:]?\s*(\d{2,4})/i);
+  // 1) 风控分类只认显式 code：结构化数据字段，或文本中明确标注的「风控码/错误码/code = N」
+  const fromData = explicitCode(data);
+  if (fromData) return { category: 'risk', code: fromData, ...RISK_CODES[fromData] };
+  const hay = String(text || '');
+  const m = hay.match(/(?:风控码|错误码|code)\s*[=:]\s*(\d{2,4})/i);
   if (m && RISK_CODES[Number(m[1])]) {
     const code = Number(m[1]);
     return { category: 'risk', code, ...RISK_CODES[code] };
   }
-  // 2) 关键词兜底
-  for (const { code, re } of TEXT_PATTERNS) {
-    if (re.test(hay)) return { category: 'risk', code, ...RISK_CODES[code] };
-  }
-  // 3) 桥层失败分类（非风控）
+  // 2) 桥层运行状态（非风控分类，保留原口径）
   if (/控制桥未开启|控制桥未就绪|控制桥记录已失效/.test(hay)) {
     return { category: 'bridge_unavailable', retryable: true, requireHuman: true };
   }
@@ -58,14 +58,6 @@ export function classifyError(text, data) {
     return { category: 'timeout', retryable: true, requireHuman: false };
   }
   return null;
-}
-
-function safeJson(v) {
-  try {
-    return v == null ? '' : JSON.stringify(v);
-  } catch {
-    return '';
-  }
 }
 
 /**

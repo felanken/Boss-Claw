@@ -187,7 +187,7 @@ export const agentTools = [
     annotations: WRITE_LOCAL,
     inputSchema: obj({
       greeting: str('招呼语（可选；不传则用页面当前内容）'),
-      idempotencyKey: str('幂等键（可选）：同一键+同一招呼语的重复调用在 10 分钟内只真正发送一次'),
+      idempotencyKey: str('幂等键（可选）：显式传键时同一键+同一招呼语的重复调用在 10 分钟内只真正发送一次；未传键时同参数调用仅在途去重并保留 60 秒成功缓存'),
     }),
     handler: async (args = {}) => {
       const params = {};

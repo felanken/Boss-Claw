@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { validateActionParams, ACTION_PARAM_SPECS } from '../src/actionSchema.mjs';
 import { classifyError, RISK_CODES } from '../src/errors.mjs';
-import { IdempotencyStore, idempotencyKey } from '../src/idempotency.mjs';
+import { IdempotencyStore, idempotencyKey, DEFAULT_TTL_MS } from '../src/idempotency.mjs';
 import { controlTools } from '../src/tools/control.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -36,19 +36,21 @@ const enumValues = appAction.inputSchema.properties.action.enum || [];
 const missing = enumValues.filter((a) => !ACTION_PARAM_SPECS[a]);
 record('校验：spec 覆盖全部动作', missing.length === 0, missing.length ? `缺失 ${missing.join(',')}` : `${enumValues.length} 个动作全覆盖`);
 
-// ---- 2) 结构化错误分类 ----
-const c32 = classifyError('投递失败 code 32 账户已被限制');
-record('错误：code 32 -> banned/不可重试/需人工', !!c32 && c32.code === 32 && c32.retryable === false && c32.requireHuman === true);
-const c35 = classifyError('需要安全验证（滑块）请人工完成');
-record('错误：滑块文案 -> 35/challenge', !!c35 && c35.code === 35 && c35.requireHuman === true);
-const c1006 = classifyError('请求过于频繁');
-record('错误：限速 -> 1006/可重试/不需人工', !!c1006 && c1006.code === 1006 && c1006.retryable === true && c1006.requireHuman === false);
+// ---- 2) 结构化错误分类（第三提交定版：风控只认显式 code 与结构化错误字段） ----
+const c32 = classifyError('投递失败', { code: 32 });
+record('错误：数据字段 code 32 -> banned/不可重试/需人工', !!c32 && c32.code === 32 && c32.retryable === false && c32.requireHuman === true);
+const c35 = classifyError('投递失败 错误码=35');
+record('错误：文本显式 错误码=35 -> challenge', !!c35 && c35.code === 35 && c35.requireHuman === true);
+record('错误：仅关键词文案不再臆测风控码', classifyError('需要安全验证（滑块）请人工完成') === null && classifyError('请求过于频繁') === null);
+const c1006 = classifyError('投递失败', { error: { errorCode: '1006' } });
+record('错误：嵌套 error.errorCode 1006 -> 可重试/不需人工', !!c1006 && c1006.code === 1006 && c1006.retryable === true && c1006.requireHuman === false);
 const cBridge = classifyError('应用内控制桥未开启。请用 bossclaw_app_start 启动');
 record('错误：桥未开启 -> bridge_unavailable', !!cBridge && cBridge.category === 'bridge_unavailable');
 record('错误：普通失败不臆测', classifyError('页面结构变化') === null);
 record('错误：RISK_CODES 与应用口径项数', Object.keys(RISK_CODES).length === 10);
 
 // ---- 3) 幂等去重 ----
+record('幂等：默认成功缓存 TTL 为 60 秒（评审定版）', DEFAULT_TTL_MS === 60_000);
 {
   const store = new IdempotencyStore(60_000);
   let calls = 0;

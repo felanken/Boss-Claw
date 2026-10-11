@@ -21,7 +21,7 @@ function redactSecrets(v) {
   if (v && typeof v === 'object') {
     const out = {};
     for (const [k, val] of Object.entries(v)) {
-      if (/api[-_]?key|token|secret|password/i.test(k) && typeof val === 'string' && val) {
+      if (/api[-_]?key|access[-_]?key|private[-_]?key|token|secret|password|passwd|credential|authorization|cookie|session/i.test(k) && typeof val === 'string' && val) {
         out[k] = '***redacted***';
       } else {
         out[k] = redactSecrets(val);
@@ -276,7 +276,7 @@ export const controlTools = [
       {
         action: enumStr('动作类型', ACTIONS),
         params: { type: 'object', description: '动作参数（见工具描述；MCP 层会按动作做必填/类型校验）', additionalProperties: true },
-        idempotencyKey: str('幂等键（可选，仅对 deliverySendNow 生效）：同一键+同一参数的重复调用在 10 分钟内只真正执行一次'),
+        idempotencyKey: str('幂等键（可选，仅对 deliverySendNow 生效）：显式传键时同一键+同一参数的重复调用在 10 分钟内只真正执行一次；未传键时同参数调用仅在途去重并保留 60 秒成功缓存'),
       },
       ['action']
     ),
@@ -336,7 +336,7 @@ export const controlTools = [
         }
         return out;
       };
-      // P0-4: 发送类动作走 MCP 层幂等去重（同键/同参数 10 分钟内只真正发送一次）。
+      // P0-4: 发送类动作走 MCP 层幂等去重（显式键 10 分钟长窗口；同参数自动去重仅在途+60 秒）。
       const scope = `bossclaw_app_action:${args.action}`;
       if (SEND_SCOPE.has(scope)) {
         return sendIdempotency.run(idempotencyKey(scope, paramsNoTop, explicitKey), execute);

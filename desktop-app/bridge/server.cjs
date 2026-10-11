@@ -40,6 +40,8 @@ function resolveBridgeToken() {
   } catch { /* 文件不存在或损坏时走生成分支 */ }
   const token = crypto.randomBytes(24).toString('hex');
   try {
+    // mode 0600 在 Windows 上基本无效（NTFS 不吃 POSIX 权限位），Windows 下实际靠
+    // 用户目录 %USERPROFILE%\.bossclaw 本身的账户隔离兜底；类 Unix 下严格生效。
     fs.writeFileSync(tokenFilePath, JSON.stringify({ token }, null, 2), { mode: 0o600 });
   } catch (error) {
     console.warn(`[OpenClaw bridge] 随机 token 落盘失败（本次进程内有效）：${error.message}`);
@@ -253,6 +255,8 @@ async function parseResumeText(payload) {
 // 无 Origin 的本机非浏览器客户端）回显 CORS 头；其余来源不给 CORS 头，浏览器侧自然拦截。
 function isLocalOrigin(origin) {
   if (!origin) return true;
+  // 注意：'null' 是 file:// 页面与沙箱 iframe 的 Origin，桌面端渲染进程正是 file://。
+  // 这类来源无法靠 Origin 区分敌我，token 是它们唯一的实际屏障（故 token 必须随机且只走请求头）。
   if (origin === 'null') return true;
   try {
     const { hostname } = new URL(origin);
@@ -279,10 +283,13 @@ function respond(response, status, payload, origin) {
 const server = http.createServer((request, response) => {
   const requestUrl = new URL(request.url, `http://127.0.0.1:${config.port}`);
   const origin = request.headers.origin || '';
-  // token 优先走请求头（不进 URL/日志）；query 参数仅为兼容旧客户端保留。
-  const token = request.headers['x-bossclaw-token'] || requestUrl.searchParams.get('token') || '';
+  // token 只走请求头：query 参数会进 URL 与日志，评审定版移除该兼容路径。
+  const token = request.headers['x-bossclaw-token'] || '';
   if (request.method === 'OPTIONS') return respond(response, 200, {}, origin);
-  if (token !== bridgeAuth.token) return respond(response, 403, { ok: false, error: 'token denied' }, origin);
+  const tokenBuf = Buffer.from(String(token));
+  const expectBuf = Buffer.from(String(bridgeAuth.token));
+  const tokenOk = tokenBuf.length === expectBuf.length && crypto.timingSafeEqual(tokenBuf, expectBuf);
+  if (!tokenOk) return respond(response, 403, { ok: false, error: 'token denied' }, origin);
 
   let body = '';
   let tooLarge = false;

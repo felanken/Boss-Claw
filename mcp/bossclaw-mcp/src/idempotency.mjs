@@ -5,12 +5,16 @@
 // 再加一层（纵深防御，不替代应用侧不变量）：
 //   · 键：调用方显式传的 idempotencyKey 优先；否则用「工具+动作+参数」的稳定哈希。
 //   · 在途重复：直接复用在途 Promise 的结果，不再向应用发第二次请求；
-//   · 已成功：TTL 内返回缓存结果并标注 deduplicated:true，不再重复发送；
+//   · 已成功：参数哈希键只保留 60 秒成功缓存（评审定版：在途去重＋短缓存，避免
+//     长时间缓存掩盖真实重发意图，如队列变化后同参数再次触发）；显式 idempotencyKey
+//     是调用方明确声明的「同一请求」，保留 10 分钟长窗口。
 //   · 失败不缓存：失败（含风控）不落缓存，后续重试语义不变——是否可重试由结构化错误决定。
 // 只作用于发送类动作集合 SEND_SCOPE，普通读写动作不经过这里。
 import { createHash } from 'node:crypto';
 
-export const DEFAULT_TTL_MS = 10 * 60 * 1000;
+export const DEFAULT_TTL_MS = 60 * 1000;
+/** 显式 idempotencyKey 的成功缓存窗口（调用方明确声明同一请求时才用长窗口） */
+export const EXPLICIT_TTL_MS = 10 * 60 * 1000;
 const MAX_ENTRIES = 200;
 
 /** 需要幂等保护的「工具:动作」集合 */
@@ -30,15 +34,21 @@ export function idempotencyKey(scope, payload, explicitKey) {
 }
 
 export class IdempotencyStore {
-  constructor(ttlMs = DEFAULT_TTL_MS) {
+  constructor(ttlMs = DEFAULT_TTL_MS, explicitTtlMs = EXPLICIT_TTL_MS) {
     this.ttlMs = ttlMs;
-    /** Map<key, { promise: Promise, settled: boolean, result: any, at: number }> */
+    this.explicitTtlMs = explicitTtlMs;
+    /** Map<key, { promise: Promise, settled: boolean, result: any, at: number, ttl: number }> */
     this.entries = new Map();
+  }
+
+  /** 显式键（':key:' 段）用长窗口，参数哈希键用短窗口 */
+  ttlFor(key) {
+    return key.includes(':key:') ? this.explicitTtlMs : this.ttlMs;
   }
 
   prune(now = Date.now()) {
     for (const [k, e] of this.entries) {
-      if (e.settled && now - e.at > this.ttlMs) this.entries.delete(k);
+      if (e.settled && now - e.at > e.ttl) this.entries.delete(k);
     }
     while (this.entries.size > MAX_ENTRIES) {
       const first = this.entries.keys().next().value;
@@ -60,7 +70,7 @@ export class IdempotencyStore {
       this.entries.delete(key);
     }
     const promise = (async () => fn())();
-    const entry = { promise, settled: false, result: null, at: Date.now() };
+    const entry = { promise, settled: false, result: null, at: Date.now(), ttl: this.ttlFor(key) };
     this.entries.set(key, entry);
     try {
       const result = await promise;
